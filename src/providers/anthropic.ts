@@ -83,7 +83,7 @@ export class AnthropicProvider extends BaseProvider {
       const client = new Anthropic(clientOpts);
 
       const params: Record<string, unknown> = {
-        model: request.model,
+        model: this.model,
         messages: request.messages,
         max_tokens: request.max_tokens ?? 4096,
         stream: request.stream || false,
