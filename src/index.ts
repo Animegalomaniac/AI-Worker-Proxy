@@ -43,7 +43,13 @@ export default {
       }
 
       // Models list — no auth required (matches OpenAI behavior)
-      if ((path === '/models' || path === '/v1/models') && request.method === 'GET') {
+      if (
+        request.method === 'GET' &&
+        (path === '/models' ||
+          path === '/v1/models' ||
+          path === '/anthropic/models' ||
+          path === '/anthropic/v1/models')
+      ) {
         const router = new Router(env);
         return json({
           object: 'list',
