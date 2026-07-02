@@ -103,6 +103,19 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
     }));
   }
 
+  // Map Anthropic tool_choice to OpenAI tool_choice
+  if (anthropicReq.tool_choice) {
+    const tc = anthropicReq.tool_choice;
+    if (tc.type === 'auto' || tc.type === 'any') {
+      openAIReq.tool_choice = 'auto';
+    } else if (tc.type === 'tool' && tc.name) {
+      openAIReq.tool_choice = {
+        type: 'function',
+        function: { name: tc.name },
+      };
+    }
+  }
+
   return openAIReq;
 }
 
