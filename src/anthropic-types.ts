@@ -1,8 +1,11 @@
 // Anthropic Messages API types
 
 export interface AnthropicContentBlock {
-  type: 'text' | 'image' | 'tool_use' | 'tool_result';
+  type: 'text' | 'image' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking';
   text?: string;
+  thinking?: string;
+  signature?: string;
+  data?: string;
   // image source
   source?: {
     type: 'base64';

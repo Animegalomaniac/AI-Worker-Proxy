@@ -285,6 +285,11 @@ function json(data: unknown, status = 200): Response {
 }
 
 function verifyAuth(request: Request, env: Env): boolean {
+  if (!env.PROXY_AUTH_TOKEN) {
+    console.error('[verifyAuth] PROXY_AUTH_TOKEN not configured — rejecting all requests');
+    return false;
+  }
+
   // OpenAI-style: Authorization: Bearer <token>
   const authHeader = request.headers.get('Authorization');
   if (authHeader) {
@@ -294,7 +299,7 @@ function verifyAuth(request: Request, env: Env): boolean {
 
   // Anthropic-style: x-api-key: <token>
   const apiKey = request.headers.get('x-api-key');
-  if (apiKey && apiKey === env.PROXY_AUTH_TOKEN) return true;
+  if (apiKey === env.PROXY_AUTH_TOKEN) return true;
 
   return false;
 }

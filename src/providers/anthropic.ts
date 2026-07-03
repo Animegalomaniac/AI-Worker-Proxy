@@ -121,16 +121,23 @@ export class AnthropicProvider extends BaseProvider {
     let content = '';
     let toolCalls: ToolCall[] | undefined;
 
-    for (const block of response.content) {
-      if (block.type === 'text') {
-        content += block.text;
-      } else if (block.type === 'tool_use') {
+      for (const rawBlock of response.content) {
+      const block = rawBlock as unknown as Record<string, unknown>;
+      const blockType = block.type as string;
+      if (blockType === 'thinking' || blockType === 'redacted_thinking') {
+        const label = blockType === 'thinking' ? 'thinking' : 'redacted_thinking';
+        const thinkingText = typeof block.thinking === 'string' ? block.thinking : '';
+        const dataText = typeof block.data === 'string' ? block.data : '';
+        content += `\n\n[${label}] ${thinkingText || dataText}[/${label}]\n\n`;
+      } else if (blockType === 'text') {
+        content += block.text as string;
+      } else if (blockType === 'tool_use') {
         if (!toolCalls) toolCalls = [];
         toolCalls.push({
-          id: block.id,
+          id: block.id as string,
           type: 'function',
           function: {
-            name: block.name,
+            name: block.name as string,
             arguments: JSON.stringify(block.input),
           },
         });
@@ -161,7 +168,9 @@ export class AnthropicProvider extends BaseProvider {
         let toolCallIndex = -1;
         let hasToolCalls = false;
 
-        for await (const event of stream) {
+        for await (const rawEvent of stream) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const event = rawEvent as any;
           if (event.type === 'content_block_start') {
             if (event.content_block.type === 'tool_use') {
               toolCallIndex++;
@@ -174,6 +183,11 @@ export class AnthropicProvider extends BaseProvider {
                   event.content_block.name
                 )
               );
+            } else if (
+              event.content_block.type === 'thinking' ||
+              event.content_block.type === 'redacted_thinking'
+            ) {
+              await writer.write(session.textChunk('\n[thinking]\n'));
             }
           } else if (event.type === 'content_block_delta') {
             if (event.delta.type === 'text_delta') {
@@ -185,6 +199,14 @@ export class AnthropicProvider extends BaseProvider {
                   session.toolCallArgsChunk(toolCallIndex, event.delta.partial_json)
                 );
               }
+            } else if (event.delta.type === 'thinking_delta') {
+              const thinking = event.delta.thinking;
+              if (typeof thinking === 'string') {
+                await writer.write(session.textChunk(thinking));
+              }
+            } else if (event.delta.type === 'signature_delta') {
+              // Signature delta — end thinking block
+              await writer.write(session.textChunk('\n[/thinking]\n'));
             }
           } else if (event.type === 'message_stop') {
             const reason = hasToolCalls ? 'tool_calls' : 'stop';
