@@ -121,7 +121,7 @@ export class AnthropicProvider extends BaseProvider {
     let content = '';
     let toolCalls: ToolCall[] | undefined;
 
-      for (const rawBlock of response.content) {
+    for (const rawBlock of response.content) {
       const block = rawBlock as unknown as Record<string, unknown>;
       const blockType = block.type as string;
       if (blockType === 'thinking' || blockType === 'redacted_thinking') {
