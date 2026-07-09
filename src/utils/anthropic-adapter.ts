@@ -20,6 +20,16 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
     } else {
       // Content is an array of blocks
       const contentParts: ContentPart[] = [];
+      const flushContentParts = () => {
+        if (contentParts.length > 0) {
+          if (contentParts.length === 1 && contentParts[0].type === 'text') {
+            messages.push({ role: msg.role, content: contentParts[0].text });
+          } else {
+            messages.push({ role: msg.role, content: [...contentParts] });
+          }
+          contentParts.length = 0;
+        }
+      };
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
           contentParts.push({ type: 'text', text: block.text });
@@ -43,6 +53,7 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
                     .map((c) => c.text)
                     .join(' ')
                 : '';
+          flushContentParts();
           messages.push({
             role: 'tool',
             tool_call_id: block.tool_use_id || '',
@@ -51,6 +62,7 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
           continue; // Already pushed, skip the main push below
         } else if (block.type === 'tool_use' && block.name) {
           // Tool use from assistant messages
+          flushContentParts();
           messages.push({
             role: msg.role,
             content: null,
@@ -68,15 +80,7 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
           continue; // Already pushed
         }
       }
-      if (contentParts.length > 0) {
-        // Pure single text part — keep as string for backward compatibility
-        if (contentParts.length === 1 && contentParts[0].type === 'text') {
-          messages.push({ role: msg.role, content: contentParts[0].text });
-        } else {
-          // Has images or mixed content — use structured array format
-          messages.push({ role: msg.role, content: contentParts });
-        }
-      }
+      flushContentParts();
     }
   }
 
@@ -196,6 +200,7 @@ export function convertOpenAIResponseToAnthropic(
  */
 export class AnthropicStreamAdapter {
   private encoder = new TextEncoder();
+  private decoder = new TextDecoder();
   /** Monotonically increasing counter for the next content block index */
   private blockIndex = 0;
   /** Index of the currently active content block (used by stopBlock and deltas) */
@@ -203,6 +208,8 @@ export class AnthropicStreamAdapter {
   private started = false;
   private textBlockActive = false;
   private toolBlockActive = false;
+  /** Maps OpenAI tool call index → Anthropic content block index */
+  private toolBlockIndexMap = new Map<number, number>();
 
   constructor(
     private model: string,
@@ -261,7 +268,7 @@ export class AnthropicStreamAdapter {
     return new TransformStream({
       transform: (chunk, controller) => {
         // Use { stream: true } for proper multi-byte UTF-8 handling across chunks
-        const text = lineBuffer + new TextDecoder().decode(chunk, { stream: true });
+        const text = lineBuffer + this.decoder.decode(chunk, { stream: true });
         const lines = text.split('\n');
 
         // Last element may be a partial line — keep it in the buffer for the next chunk
@@ -339,6 +346,9 @@ export class AnthropicStreamAdapter {
           currentToolIndex++;
           this.activeBlockIndex = this.blockIndex++;
           this.toolBlockActive = true;
+          if (tc.index !== undefined) {
+            this.toolBlockIndexMap.set(tc.index, this.activeBlockIndex);
+          }
 
           controller.enqueue(
             this.encodeSSE('content_block_start', {
@@ -355,10 +365,14 @@ export class AnthropicStreamAdapter {
         }
 
         if (tc.function?.arguments !== undefined) {
+          const blockIdx =
+            tc.index !== undefined
+              ? (this.toolBlockIndexMap.get(tc.index) ?? this.activeBlockIndex)
+              : this.activeBlockIndex;
           controller.enqueue(
             this.encodeSSE('content_block_delta', {
               type: 'content_block_delta',
-              index: this.activeBlockIndex,
+              index: blockIdx,
               delta: {
                 type: 'input_json_delta',
                 partial_json: tc.function.arguments,
