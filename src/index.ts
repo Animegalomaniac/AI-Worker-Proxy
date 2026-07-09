@@ -306,7 +306,7 @@ function verifyAuth(request: Request, env: Env): boolean {
 
 function resolveApiKeys(config: ProviderConfig, env: Env): string[] {
   const keys: string[] = [];
-  for (const keyName of config.apiKeys) {
+  for (const keyName of config.apiKeys ?? []) {
     const value = env[keyName];
     if (value) {
       keys.push(value);

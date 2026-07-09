@@ -135,6 +135,7 @@ export class GoogleProvider extends BaseProvider {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const session = new StreamSession(this.model);
+    const encoder = new TextEncoder();
 
     (async () => {
       try {
@@ -170,6 +171,9 @@ export class GoogleProvider extends BaseProvider {
       } catch (error) {
         console.error('[GoogleProvider] Stream error:', error);
         try {
+          await writer.write(
+            encoder.encode(`data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`)
+          );
           await writer.write(session.finishChunk('stop'));
           await writer.write(session.done());
         } catch {

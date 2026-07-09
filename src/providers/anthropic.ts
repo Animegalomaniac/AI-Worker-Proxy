@@ -138,7 +138,7 @@ export class AnthropicProvider extends BaseProvider {
           type: 'function',
           function: {
             name: block.name as string,
-            arguments: JSON.stringify(block.input),
+            arguments: JSON.stringify(block.input ?? {}),
           },
         });
       }
@@ -217,6 +217,7 @@ export class AnthropicProvider extends BaseProvider {
       } catch (error) {
         console.error('[AnthropicProvider] Stream error:', error);
         try {
+          await writer.write(new TextEncoder().encode(`data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`));
           await writer.write(session.finishChunk('stop'));
           await writer.write(session.done());
         } catch {
@@ -265,9 +266,13 @@ export class AnthropicProvider extends BaseProvider {
       } catch (error) {
         console.error('[AnthropicProvider] Native stream error:', error);
         try {
-          const errorEvent = { type: 'message_stop' };
+          const errorEvent = { type: 'error', error: { type: 'stream_error', message: 'Stream terminated due to upstream error' } };
           await writer.write(
-            encoder.encode(`event: message_stop\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+            encoder.encode(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+          );
+          const stopEvent = { type: 'message_stop' };
+          await writer.write(
+            encoder.encode(`event: message_stop\ndata: ${JSON.stringify(stopEvent)}\n\n`)
           );
         } catch {
           // Writer may already be closed

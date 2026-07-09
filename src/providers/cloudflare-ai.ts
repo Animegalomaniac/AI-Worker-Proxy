@@ -70,6 +70,7 @@ export class CloudflareAIProvider extends BaseProvider {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const session = new StreamSession(this.model);
+    const encoder = new TextEncoder();
 
     (async () => {
       try {
@@ -77,6 +78,8 @@ export class CloudflareAIProvider extends BaseProvider {
 
         const reader = cfStream.getReader();
         let hasToolCalls = false;
+        // Stable tool call IDs across stream chunks
+        const toolCallIdMap = new Map<number, string>();
 
         for (;;) {
           const { done, value } = await reader.read();
@@ -102,7 +105,10 @@ export class CloudflareAIProvider extends BaseProvider {
             hasToolCalls = true;
             for (let i = 0; i < toolCalls.length; i++) {
               const tc = toolCalls[i];
-              const callId = `call_${generateId(24)}`;
+              if (!toolCallIdMap.has(i)) {
+                toolCallIdMap.set(i, `call_${generateId(24)}`);
+              }
+              const callId = toolCallIdMap.get(i)!;
               await writer.write(session.toolCallStartChunk(i, callId, tc.name));
               await writer.write(session.toolCallArgsChunk(i, JSON.stringify(tc.arguments)));
             }
@@ -116,6 +122,9 @@ export class CloudflareAIProvider extends BaseProvider {
       } catch (error) {
         console.error('[CloudflareAIProvider] Stream error:', error);
         try {
+          await writer.write(
+            encoder.encode(`data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`)
+          );
           await writer.write(session.finishChunk('stop'));
           await writer.write(session.done());
         } catch {
@@ -143,16 +152,25 @@ export class CloudflareAIProvider extends BaseProvider {
             : msg.content
               ? msg.content.map((p) => (p.type === 'text' ? p.text : '')).join(' ')
               : '';
-        return { role: 'user', content: toolContent };
+        return {
+          role: 'tool',
+          content: toolContent,
+          tool_call_id: msg.tool_call_id || '',
+        };
       }
-      if (msg.role === 'assistant' && msg.tool_calls) {
-        const assistantContent =
+      if (msg.role === 'assistant') {
+        const result: Record<string, unknown> = { role: 'assistant' };
+        const textContent =
           typeof msg.content === 'string'
             ? msg.content || ''
             : msg.content
               ? msg.content.map((p) => (p.type === 'text' ? p.text : '')).join(' ')
               : '';
-        return { role: 'assistant', content: assistantContent };
+        result.content = textContent;
+        if (msg.tool_calls) {
+          result.tool_calls = msg.tool_calls;
+        }
+        return result;
       }
       const textContent =
         typeof msg.content === 'string'

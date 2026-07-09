@@ -69,7 +69,7 @@ export class TokenManager {
   private getApiKeys(): string[] {
     const keys: string[] = [];
 
-    for (const keyName of this.config.apiKeys) {
+    for (const keyName of this.config.apiKeys ?? []) {
       const keyValue = this.env[keyName];
       if (keyValue) {
         keys.push(keyValue);
