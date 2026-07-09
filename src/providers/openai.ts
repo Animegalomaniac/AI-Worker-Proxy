@@ -68,7 +68,9 @@ export class OpenAIProvider extends BaseProvider {
         try {
           // Notify client of error before closing
           await writer.write(
-            encoder.encode(`data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`)
+            encoder.encode(
+              `data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`
+            )
           );
           // Send a clean finish so the client doesn't hang
           const errorFinish = {

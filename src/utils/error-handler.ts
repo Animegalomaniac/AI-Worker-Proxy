@@ -67,10 +67,14 @@ export function isRetryableError(error: unknown): boolean {
   const e = error as ErrorLike;
   return (
     isRateLimitError(error) ||
-    e.status === 503 || e.statusCode === 503 ||
-    e.status === 502 || e.statusCode === 502 ||
-    e.status === 504 || e.statusCode === 504 ||
-    e.status === 408 || e.statusCode === 408 ||
+    e.status === 503 ||
+    e.statusCode === 503 ||
+    e.status === 502 ||
+    e.statusCode === 502 ||
+    e.status === 504 ||
+    e.statusCode === 504 ||
+    e.status === 408 ||
+    e.statusCode === 408 ||
     (typeof e.message === 'string' && e.message.toLowerCase().includes('timeout')) ||
     (typeof e.message === 'string' && e.message.toLowerCase().includes('overloaded'))
   );

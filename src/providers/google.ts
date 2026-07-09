@@ -172,7 +172,9 @@ export class GoogleProvider extends BaseProvider {
         console.error('[GoogleProvider] Stream error:', error);
         try {
           await writer.write(
-            encoder.encode(`data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`)
+            encoder.encode(
+              `data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`
+            )
           );
           await writer.write(session.finishChunk('stop'));
           await writer.write(session.done());
