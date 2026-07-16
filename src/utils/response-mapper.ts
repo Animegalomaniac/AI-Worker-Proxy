@@ -17,7 +17,8 @@ export function createOpenAIResponse(
 ): OpenAIChatResponse {
   const message: OpenAIMessage = {
     role: 'assistant',
-    content: toolCalls ? null : content,
+    // Preserve text when present even alongside tool calls (Claude/Gemini emit both)
+    content: toolCalls ? content || null : content,
   };
 
   if (toolCalls && toolCalls.length > 0) {

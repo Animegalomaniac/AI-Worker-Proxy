@@ -1,5 +1,5 @@
 import { AnthropicRequest, AnthropicResponse, AnthropicContentBlock } from '../anthropic-types';
-import { OpenAIChatRequest, OpenAIChatResponse, OpenAIMessage, ContentPart } from '../types';
+import { OpenAIChatRequest, OpenAIChatResponse, OpenAIMessage, ContentPart, ToolCall } from '../types';
 
 /**
  * Convert an Anthropic-format request to OpenAI-format request.
@@ -30,10 +30,22 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
           contentParts.length = 0;
         }
       };
+      // Accumulate consecutive tool_use blocks into one assistant message —
+      // OpenAI requires tool messages to directly follow a single assistant
+      // tool_calls message, so parallel calls must not be split apart.
+      const pendingToolCalls: ToolCall[] = [];
+      const flushToolCalls = () => {
+        if (pendingToolCalls.length > 0) {
+          messages.push({ role: msg.role, content: null, tool_calls: [...pendingToolCalls] });
+          pendingToolCalls.length = 0;
+        }
+      };
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
+          flushToolCalls();
           contentParts.push({ type: 'text', text: block.text });
         } else if (block.type === 'image' && block.source) {
+          flushToolCalls();
           // Convert Anthropic image block to OpenAI image_url format
           contentParts.push({
             type: 'image_url',
@@ -53,6 +65,7 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
                     .map((c) => c.text)
                     .join(' ')
                 : '';
+          flushToolCalls();
           flushContentParts();
           messages.push({
             role: 'tool',
@@ -61,26 +74,22 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
           });
           continue; // Already pushed, skip the main push below
         } else if (block.type === 'tool_use' && block.name) {
-          // Tool use from assistant messages
+          // Tool use from assistant messages — accumulate so parallel calls
+          // share one assistant message (flushed by flushToolCalls)
           flushContentParts();
-          messages.push({
-            role: msg.role,
-            content: null,
-            tool_calls: [
-              {
-                id: block.id || '',
-                type: 'function',
-                function: {
-                  name: block.name,
-                  arguments: JSON.stringify(block.input),
-                },
-              },
-            ],
+          pendingToolCalls.push({
+            id: block.id || '',
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: JSON.stringify(block.input ?? {}),
+            },
           });
-          continue; // Already pushed
+          continue; // Accumulated, skip the main push below
         }
       }
       flushContentParts();
+      flushToolCalls();
     }
   }
 
@@ -308,6 +317,28 @@ export class AnthropicStreamAdapter {
       return toolIndex;
     }
 
+    // Upstream-injected error (provider stream catch blocks) — surface it to
+    // the client instead of letting the following finish look like a clean end
+    if (parsed.error) {
+      if (!this.started) {
+        this.started = true;
+        this.startMessage(controller);
+      }
+      controller.enqueue(
+        this.encodeSSE('error', {
+          type: 'error',
+          error: {
+            type: 'stream_error',
+            message:
+              typeof parsed.error.message === 'string'
+                ? parsed.error.message
+                : 'Upstream stream error',
+          },
+        })
+      );
+      return toolIndex;
+    }
+
     const choice = parsed.choices?.[0];
     if (!choice) return toolIndex;
 
@@ -321,8 +352,13 @@ export class AnthropicStreamAdapter {
     }
 
     // Text content delta
-    if (delta.content !== undefined && delta.content !== null) {
-      if (!this.textBlockActive && !this.toolBlockActive) {
+    if (delta.content) {
+      // Text arrived while a tool block is active (e.g. Gemini interleaves
+      // text after function calls) — close it and start a fresh text block
+      if (this.toolBlockActive) {
+        this.stopBlock(controller);
+      }
+      if (!this.textBlockActive) {
         this.startTextBlock(controller);
       }
       controller.enqueue(

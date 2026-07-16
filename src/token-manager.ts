@@ -82,6 +82,13 @@ export class TokenManager {
   }
 
   private isRetryableStatusCode(statusCode: number): boolean {
-    return statusCode === 429 || statusCode === 503 || statusCode === 502;
+    // Keep in sync with isRetryableError in utils/error-handler.ts
+    return (
+      statusCode === 429 ||
+      statusCode === 503 ||
+      statusCode === 502 ||
+      statusCode === 504 ||
+      statusCode === 408
+    );
   }
 }

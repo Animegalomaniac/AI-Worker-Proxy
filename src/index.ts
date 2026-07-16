@@ -193,7 +193,8 @@ async function handleAnthropicNativePath(
         const result = await withTimeout(provider.nativeChat(body, apiKey));
         if (!result.success) {
           lastError = result.error;
-          if (result.statusCode && ![429, 502, 503].includes(result.statusCode)) {
+          // Keep in sync with isRetryableError in utils/error-handler.ts
+          if (result.statusCode && ![429, 502, 503, 504, 408].includes(result.statusCode)) {
             break;
           }
           continue;
