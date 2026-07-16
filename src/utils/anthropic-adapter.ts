@@ -1,5 +1,11 @@
 import { AnthropicRequest, AnthropicResponse, AnthropicContentBlock } from '../anthropic-types';
-import { OpenAIChatRequest, OpenAIChatResponse, OpenAIMessage, ContentPart, ToolCall } from '../types';
+import {
+  OpenAIChatRequest,
+  OpenAIChatResponse,
+  OpenAIMessage,
+  ContentPart,
+  ToolCall,
+} from '../types';
 
 /**
  * Convert an Anthropic-format request to OpenAI-format request.
