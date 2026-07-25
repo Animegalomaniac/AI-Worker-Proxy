@@ -17,12 +17,27 @@ export class TokenManager {
     const apiKeys = this.getApiKeys();
 
     if (apiKeys.length === 0) {
-      // For providers that don't need API keys (like Cloudflare AI)
-      return await provider.chat(request, '');
+      // Cloudflare AI uses a binding instead of API keys; *-compatible providers may
+      // point at keyless local gateways (vLLM, Ollama, ...) — let the upstream decide.
+      if (
+        this.config.provider === 'cloudflare-ai' ||
+        this.config.provider === 'openai-compatible' ||
+        this.config.provider === 'anthropic-compatible'
+      ) {
+        return await provider.chat(request, '');
+      }
+      // Official anthropic/google/openai APIs always require a key — fail fast
+      // instead of burning a request that will just 401 upstream.
+      return {
+        success: false,
+        error: `No API keys configured for ${this.config.provider}/${this.config.model}`,
+        statusCode: 500,
+      };
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let lastError: any = null;
+    let lastStatusCode: number | undefined;
 
     // Try each API key in order
     for (let i = 0; i < apiKeys.length; i++) {
@@ -32,7 +47,8 @@ export class TokenManager {
           `[TokenManager] Trying ${this.config.provider}/${this.config.model} with key ${i + 1}/${apiKeys.length}`
         );
 
-        const response = await withTimeout(provider.chat(request, apiKey));
+        const timeoutMs = Number(this.env.PROVIDER_TIMEOUT_MS) || undefined;
+        const response = await withTimeout(provider.chat(request, apiKey), timeoutMs);
 
         if (response.success) {
           console.log(`[TokenManager] Success with key ${i + 1}/${apiKeys.length}`);
@@ -41,6 +57,9 @@ export class TokenManager {
 
         // If response failed but it's retryable, try next key
         lastError = response.error;
+        if (response.statusCode) {
+          lastStatusCode = response.statusCode;
+        }
         console.log(`[TokenManager] Failed with key ${i + 1}/${apiKeys.length}: ${response.error}`);
 
         // If it's not a retryable error, don't try other keys for this provider
@@ -49,6 +68,14 @@ export class TokenManager {
         }
       } catch (error) {
         lastError = error;
+        // SDK errors carry the HTTP status on `status` (not `statusCode`) — check both
+        // so upstream status codes survive instead of collapsing to 500.
+        const status =
+          (error as { status?: number; statusCode?: number } | null)?.status ??
+          (error as { statusCode?: number } | null)?.statusCode;
+        if (status) {
+          lastStatusCode = status;
+        }
         console.error(`[TokenManager] Exception with key ${i + 1}/${apiKeys.length}:`, error);
 
         // If it's a retryable error, continue to next key
@@ -62,7 +89,7 @@ export class TokenManager {
     return {
       success: false,
       error: lastError?.message || lastError || 'All API keys failed',
-      statusCode: lastError?.statusCode || 500,
+      statusCode: lastStatusCode ?? 500,
     };
   }
 

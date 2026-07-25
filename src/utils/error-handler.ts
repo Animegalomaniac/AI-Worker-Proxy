@@ -82,9 +82,11 @@ export function isRetryableError(error: unknown): boolean {
 
 /**
  * Default timeout for external API calls (milliseconds).
- * Cloudflare Workers free plan has a 30s CPU limit — leaving 5s for proxy overhead.
+ * Non-streaming completions with large max_tokens routinely take 30–60s+, so a
+ * short timeout kills legitimate requests (waiting on upstream I/O does not count
+ * against the Workers CPU limit). Override with the PROVIDER_TIMEOUT_MS env var.
  */
-const PROVIDER_TIMEOUT_MS = 25000;
+const PROVIDER_TIMEOUT_MS = 120000;
 
 /**
  * Wrap a promise with a timeout, throwing on expiry.

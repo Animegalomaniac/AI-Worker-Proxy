@@ -80,27 +80,12 @@ export class CloudflareAIProvider extends BaseProvider {
         let hasToolCalls = false;
         // Stable tool call IDs across stream chunks
         const toolCallIdMap = new Map<number, string>();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
 
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          let text = '';
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let toolCalls: any[] | undefined;
-
-          if (typeof value === 'string') {
-            text = value;
-          } else if (value.response) {
-            text = value.response;
-            if (value.tool_calls) {
-              toolCalls = value.tool_calls;
-            }
-          } else {
-            const decoder = new TextDecoder();
-            text = decoder.decode(value);
-          }
-
+        // Emit one normalized upstream event (text chunk and/or tool calls)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const emit = async (text: string, toolCalls?: any[]): Promise<void> => {
           if (toolCalls && toolCalls.length > 0) {
             hasToolCalls = true;
             for (let i = 0; i < toolCalls.length; i++) {
@@ -114,6 +99,35 @@ export class CloudflareAIProvider extends BaseProvider {
             }
           } else if (text) {
             await writer.write(session.textChunk(text));
+          }
+        };
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          if (typeof value === 'string') {
+            await emit(value);
+          } else if (value instanceof Uint8Array) {
+            // Workers AI streams SSE-encoded bytes ("data: {"response":"..."}\n\n").
+            // Parse the SSE lines instead of leaking them into the text content.
+            sseBuffer += decoder.decode(value, { stream: true });
+            const lines = sseBuffer.split('\n');
+            // Last element may be a partial line — keep it for the next chunk
+            sseBuffer = lines.pop() || '';
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const payload = line.slice(6).trim();
+              if (!payload || payload === '[DONE]') continue;
+              try {
+                const parsed = JSON.parse(payload);
+                await emit(parsed.response || '', parsed.tool_calls);
+              } catch {
+                // Skip malformed SSE line
+              }
+            }
+          } else if (value && typeof value === 'object') {
+            await emit(value.response || '', value.tool_calls);
           }
         }
 
@@ -180,8 +194,9 @@ export class CloudflareAIProvider extends BaseProvider {
           : msg.content
             ? msg.content.map((p) => (p.type === 'text' ? p.text : '')).join(' ')
             : '';
+      // Pass roles through as-is — Workers AI chat models support the system role
       return {
-        role: msg.role === 'system' ? 'user' : msg.role,
+        role: msg.role,
         content: textContent,
       };
     });

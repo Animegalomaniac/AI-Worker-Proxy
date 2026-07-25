@@ -13,7 +13,8 @@ export function createOpenAIResponse(
   content: string,
   model: string,
   finishReason: 'stop' | 'length' | 'tool_calls' = 'stop',
-  toolCalls?: ToolCall[]
+  toolCalls?: ToolCall[],
+  usage?: OpenAIChatResponse['usage']
 ): OpenAIChatResponse {
   const message: OpenAIMessage = {
     role: 'assistant',
@@ -37,6 +38,7 @@ export function createOpenAIResponse(
         finish_reason: finishReason,
       },
     ],
+    usage,
   };
 }
 

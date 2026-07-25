@@ -50,6 +50,9 @@ export class AnthropicProvider extends BaseProvider {
           params.tool_choice = { type: 'none' };
         } else if (request.tool_choice === 'auto') {
           params.tool_choice = { type: 'auto' };
+        } else if (request.tool_choice === 'required') {
+          // OpenAI 'required' (must call a tool) ↔ Anthropic 'any'
+          params.tool_choice = { type: 'any' };
         } else if (
           typeof request.tool_choice === 'object' &&
           request.tool_choice.type === 'function'
@@ -144,17 +147,38 @@ export class AnthropicProvider extends BaseProvider {
       }
     }
 
-    const finishReason = response.stop_reason === 'tool_use' ? 'tool_calls' : 'stop';
+    const finishReason =
+      response.stop_reason === 'tool_use'
+        ? 'tool_calls'
+        : response.stop_reason === 'max_tokens'
+          ? 'length'
+          : 'stop';
+
+    const usage = response.usage
+      ? {
+          prompt_tokens: response.usage.input_tokens,
+          completion_tokens: response.usage.output_tokens,
+          total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+        }
+      : undefined;
 
     return {
       success: true,
-      response: createOpenAIResponse(content, this.model, finishReason, toolCalls),
+      response: createOpenAIResponse(content, this.model, finishReason, toolCalls, usage),
     };
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleStream(client: Anthropic, params: any): Promise<ProviderResponse> {
-    const stream = await client.messages.stream(params);
+    // Use messages.create({stream:true}) instead of messages.stream():
+    // create() awaits the upstream response, so connection-time errors (401/429/400)
+    // reject here and can trigger key rotation / provider fallback. messages.stream()
+    // is fire-and-forget — errors only surface mid-stream, after we've already
+    // reported success, which silently bypasses the whole failover chain.
+    const stream = await client.messages.create({
+      ...params,
+      stream: true,
+    } as Anthropic.MessageCreateParamsStreaming);
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const session = new StreamSession(this.model);
@@ -167,6 +191,8 @@ export class AnthropicProvider extends BaseProvider {
         // Track tool calls by index for proper incremental streaming
         let toolCallIndex = -1;
         let hasToolCalls = false;
+        // Anthropic reports the real stop reason in message_delta before message_stop
+        let stopReason: string | null = null;
 
         for await (const rawEvent of stream) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -208,8 +234,17 @@ export class AnthropicProvider extends BaseProvider {
               // Signature delta — end thinking block
               await writer.write(session.textChunk('\n[/thinking]\n'));
             }
+          } else if (event.type === 'message_delta') {
+            const deltaStopReason = event.delta?.stop_reason;
+            if (typeof deltaStopReason === 'string') {
+              stopReason = deltaStopReason;
+            }
           } else if (event.type === 'message_stop') {
-            const reason = hasToolCalls ? 'tool_calls' : 'stop';
+            const reason = hasToolCalls
+              ? 'tool_calls'
+              : stopReason === 'max_tokens'
+                ? 'length'
+                : 'stop';
             await writer.write(session.finishChunk(reason));
             await writer.write(session.done());
           }
@@ -256,7 +291,12 @@ export class AnthropicProvider extends BaseProvider {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleNativeStream(client: Anthropic, params: any): Promise<ProviderResponse> {
-    const stream = await client.messages.stream(params);
+    // Same as handleStream: create({stream:true}) awaits the upstream response so
+    // connection-time errors reject here and failover/rotation still works.
+    const stream = await client.messages.create({
+      ...params,
+      stream: true,
+    } as Anthropic.MessageCreateParamsStreaming);
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -305,12 +345,14 @@ export class AnthropicProvider extends BaseProvider {
 
     for (const msg of messages) {
       if (msg.role === 'system') {
-        system =
+        const text =
           typeof msg.content === 'string'
             ? msg.content
             : msg.content
               ? msg.content.map((p) => (p.type === 'text' ? p.text : '')).join(' ')
               : '';
+        // Multiple system messages: concatenate instead of overwriting
+        system = system ? `${system}\n\n${text}` : text;
       } else if (msg.role === 'user' || msg.role === 'assistant') {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const content: any[] = [];
@@ -323,18 +365,26 @@ export class AnthropicProvider extends BaseProvider {
               if (part.type === 'text') {
                 content.push({ type: 'text', text: part.text });
               } else if (part.type === 'image_url') {
-                // Parse data URI to extract mime type and base64 data
-                const dataUri = part.image_url.url;
-                const commaIdx = dataUri.indexOf(',');
-                if (commaIdx !== -1) {
-                  const header = dataUri.slice(0, commaIdx);
-                  const base64Data = dataUri.slice(commaIdx + 1);
-                  const mimeMatch = header.match(/^data:([^;]+)/);
-                  const mediaType = mimeMatch ? mimeMatch[1] : 'image/png';
+                const imageUrl = part.image_url.url;
+                if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+                  // Remote image URL — pass through using Anthropic's URL image source
                   content.push({
                     type: 'image',
-                    source: { type: 'base64', media_type: mediaType, data: base64Data },
+                    source: { type: 'url', url: imageUrl },
                   });
+                } else {
+                  // Parse data URI to extract mime type and base64 data
+                  const commaIdx = imageUrl.indexOf(',');
+                  if (commaIdx !== -1) {
+                    const header = imageUrl.slice(0, commaIdx);
+                    const base64Data = imageUrl.slice(commaIdx + 1);
+                    const mimeMatch = header.match(/^data:([^;]+)/);
+                    const mediaType = mimeMatch ? mimeMatch[1] : 'image/png';
+                    content.push({
+                      type: 'image',
+                      source: { type: 'base64', media_type: mediaType, data: base64Data },
+                    });
+                  }
                 }
               }
             }

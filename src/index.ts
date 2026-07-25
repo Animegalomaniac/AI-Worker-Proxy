@@ -42,7 +42,12 @@ export default {
         });
       }
 
-      // Models list — no auth required (matches OpenAI behavior)
+      // Everything below requires auth
+      if (!verifyAuth(request, env)) {
+        throw new ProxyError('Unauthorized', 401, 'invalid_auth');
+      }
+
+      // Models list (requires auth, matching OpenAI behavior)
       if (
         request.method === 'GET' &&
         (path === '/models' ||
@@ -55,11 +60,6 @@ export default {
           object: 'list',
           data: router.getAvailableModels(),
         });
-      }
-
-      // Everything below requires auth
-      if (!verifyAuth(request, env)) {
-        throw new ProxyError('Unauthorized', 401, 'invalid_auth');
       }
 
       // Anthropic-format chat completions — POST only
@@ -177,7 +177,18 @@ async function handleAnthropicNativePath(
       continue;
     }
 
-    const provider = createProvider(config, env) as AnthropicProvider;
+    let provider: AnthropicProvider;
+    try {
+      provider = createProvider(config, env) as AnthropicProvider;
+    } catch (error) {
+      // Bad config (e.g. missing baseUrl) — skip this provider, don't abort the loop
+      console.error(
+        `[AnthropicNativePath] Failed to create provider ${config.provider}/${config.model}:`,
+        error
+      );
+      lastError = error;
+      continue;
+    }
     const apiKeys = resolveApiKeys(config, env);
 
     if (apiKeys.length === 0) {
@@ -190,7 +201,8 @@ async function handleAnthropicNativePath(
 
     for (const apiKey of apiKeys) {
       try {
-        const result = await withTimeout(provider.nativeChat(body, apiKey));
+        const timeoutMs = Number(env.PROVIDER_TIMEOUT_MS) || undefined;
+        const result = await withTimeout(provider.nativeChat(body, apiKey), timeoutMs);
         if (!result.success) {
           lastError = result.error;
           // Keep in sync with isRetryableError in utils/error-handler.ts
@@ -295,14 +307,27 @@ function verifyAuth(request: Request, env: Env): boolean {
   const authHeader = request.headers.get('Authorization');
   if (authHeader) {
     const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    if (token === env.PROXY_AUTH_TOKEN) return true;
+    if (constantTimeEqual(token, env.PROXY_AUTH_TOKEN)) return true;
   }
 
   // Anthropic-style: x-api-key: <token>
   const apiKey = request.headers.get('x-api-key');
-  if (apiKey === env.PROXY_AUTH_TOKEN) return true;
+  if (apiKey !== null && constantTimeEqual(apiKey, env.PROXY_AUTH_TOKEN)) return true;
 
   return false;
+}
+
+/**
+ * Constant-time string comparison for the shared secret token.
+ * Length inequality still short-circuits — acceptable for a fixed-length token.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 function resolveApiKeys(config: ProviderConfig, env: Env): string[] {

@@ -6,6 +6,7 @@ import {
   ContentPart,
   ToolCall,
 } from '../types';
+import { ProxyError } from './error-handler';
 
 /**
  * Convert an Anthropic-format request to OpenAI-format request.
@@ -125,8 +126,11 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
   // Map Anthropic tool_choice to OpenAI tool_choice
   if (anthropicReq.tool_choice) {
     const tc = anthropicReq.tool_choice;
-    if (tc.type === 'auto' || tc.type === 'any') {
+    if (tc.type === 'auto') {
       openAIReq.tool_choice = 'auto';
+    } else if (tc.type === 'any') {
+      // Anthropic 'any' forces tool use — the OpenAI equivalent is 'required', not 'auto'
+      openAIReq.tool_choice = 'required';
     } else if (tc.type === 'tool' && tc.name) {
       openAIReq.tool_choice = {
         type: 'function',
@@ -163,7 +167,10 @@ export function convertOpenAIResponseToAnthropic(
   openaiResp: OpenAIChatResponse,
   model: string
 ): AnthropicResponse {
-  const choice = openaiResp.choices[0];
+  const choice = openaiResp.choices?.[0];
+  if (!choice) {
+    throw new ProxyError('Provider returned a response with no choices', 502);
+  }
   const message = choice.message;
   const content: AnthropicContentBlock[] = [];
 
@@ -221,6 +228,8 @@ export class AnthropicStreamAdapter {
   /** Index of the currently active content block (used by stopBlock and deltas) */
   private activeBlockIndex = 0;
   private started = false;
+  /** Set once a finish_reason chunk has been processed */
+  private finished = false;
   private textBlockActive = false;
   private toolBlockActive = false;
   /** Maps OpenAI tool call index → Anthropic content block index */
@@ -299,6 +308,21 @@ export class AnthropicStreamAdapter {
           this.processSSELine(lineBuffer, controller, currentToolIndex);
         }
         lineBuffer = '';
+        // Upstream ended without a finish_reason chunk — close gracefully so
+        // Anthropic clients don't hang waiting for message_stop
+        if (this.started && !this.finished) {
+          if (this.textBlockActive || this.toolBlockActive) {
+            this.stopBlock(controller);
+          }
+          controller.enqueue(
+            this.encodeSSE('message_delta', {
+              type: 'message_delta',
+              delta: { stop_reason: 'end_turn', stop_sequence: null },
+              usage: { output_tokens: 0 },
+            })
+          );
+          controller.enqueue(this.encodeSSE('message_stop', { type: 'message_stop' }));
+        }
       },
     });
   }
@@ -348,7 +372,9 @@ export class AnthropicStreamAdapter {
     const choice = parsed.choices?.[0];
     if (!choice) return toolIndex;
 
-    const { delta, finish_reason } = choice;
+    // Some OpenAI-compatible providers omit `delta` on the final chunk
+    const delta = choice.delta ?? {};
+    const finish_reason = choice.finish_reason;
     let currentToolIndex = toolIndex;
 
     // Start message on first chunk
@@ -427,6 +453,7 @@ export class AnthropicStreamAdapter {
 
     // Finish reason
     if (finish_reason) {
+      this.finished = true;
       if (this.textBlockActive || this.toolBlockActive) {
         this.stopBlock(controller);
       }
