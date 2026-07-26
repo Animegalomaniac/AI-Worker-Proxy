@@ -132,22 +132,4 @@ export class StreamSession {
   done(): Uint8Array {
     return this.encoder.encode('data: [DONE]\n\n');
   }
-
-  /** Write an SSE error comment (non-standard but helpful for debugging) */
-  errorChunk(_message: string): Uint8Array {
-    const payload = {
-      id: this.id,
-      object: 'chat.completion.chunk',
-      created: this.created,
-      model: this.model,
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: 'stop',
-        },
-      ],
-    };
-    return this.encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
-  }
 }
