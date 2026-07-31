@@ -76,7 +76,11 @@ export function isRetryableError(error: unknown): boolean {
     e.status === 408 ||
     e.statusCode === 408 ||
     (typeof e.message === 'string' && e.message.toLowerCase().includes('timeout')) ||
-    (typeof e.message === 'string' && e.message.toLowerCase().includes('overloaded'))
+    (typeof e.message === 'string' && e.message.toLowerCase().includes('overloaded')) ||
+    // Connection-level failures (SDK APIConnectionError, Workers fetch errors) carry
+    // no HTTP status — recognize them so key rotation can absorb transient blips
+    (typeof e.message === 'string' &&
+      /connection|fetch failed|econnreset|etimedout|socket hang up/i.test(e.message))
   );
 }
 

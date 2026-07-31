@@ -63,7 +63,12 @@ export class TokenManager {
         console.log(`[TokenManager] Failed with key ${i + 1}/${apiKeys.length}: ${response.error}`);
 
         // If it's not a retryable error, don't try other keys for this provider
-        if (response.statusCode && !this.isRetryableStatusCode(response.statusCode)) {
+        // (connection-level failures surface as 500 + message — check the message too)
+        if (
+          response.statusCode &&
+          !this.isRetryableStatusCode(response.statusCode) &&
+          !isRetryableError({ message: response.error })
+        ) {
           break;
         }
       } catch (error) {

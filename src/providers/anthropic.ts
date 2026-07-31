@@ -7,7 +7,9 @@ import { createOpenAIResponse, StreamSession } from '../utils/response-mapper';
 export class AnthropicProvider extends BaseProvider {
   async chat(request: OpenAIChatRequest, apiKey: string): Promise<ProviderResponse> {
     try {
-      const clientOpts: Record<string, unknown> = { apiKey };
+      // Retries are owned by the outer TokenManager/Router rotation — disable
+      // the SDK's built-in retry to avoid request amplification (3x per key).
+      const clientOpts: Record<string, unknown> = { apiKey, maxRetries: 0 };
       if (this.baseUrl) {
         clientOpts.baseURL = this.baseUrl;
       }
@@ -79,7 +81,9 @@ export class AnthropicProvider extends BaseProvider {
    */
   async nativeChat(request: AnthropicRequest, apiKey: string): Promise<ProviderResponse> {
     try {
-      const clientOpts: Record<string, unknown> = { apiKey };
+      // Retries are owned by the outer TokenManager/Router rotation — disable
+      // the SDK's built-in retry to avoid request amplification (3x per key).
+      const clientOpts: Record<string, unknown> = { apiKey, maxRetries: 0 };
       if (this.baseUrl) {
         clientOpts.baseURL = this.baseUrl;
       }

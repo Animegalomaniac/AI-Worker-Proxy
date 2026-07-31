@@ -54,12 +54,20 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
         } else if (block.type === 'image' && block.source) {
           flushToolCalls();
           // Convert Anthropic image block to OpenAI image_url format
-          contentParts.push({
-            type: 'image_url',
-            image_url: {
-              url: `data:${block.source.media_type};base64,${block.source.data}`,
-            },
-          });
+          if (block.source.type === 'url' && block.source.url) {
+            // URL-source image — pass through directly
+            contentParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+          } else if (block.source.media_type && block.source.data) {
+            // Base64 image — convert to OpenAI data URI
+            contentParts.push({
+              type: 'image_url',
+              image_url: {
+                url: `data:${block.source.media_type};base64,${block.source.data}`,
+              },
+            });
+          }
+          // Malformed source (missing fields) — skip silently rather than
+          // emitting a garbage `data:undefined;base64,undefined` URI
         } else if (block.type === 'tool_result') {
           // Tool results in Anthropic are content blocks in user messages;
           // in OpenAI they are separate messages with role 'tool'

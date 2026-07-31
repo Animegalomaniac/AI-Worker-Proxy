@@ -8,6 +8,8 @@ export class OpenAIProvider extends BaseProvider {
       const client = new OpenAI({
         apiKey,
         baseURL: this.baseUrl,
+        // Retries are owned by the outer TokenManager/Router rotation
+        maxRetries: 0,
       });
 
       const params:

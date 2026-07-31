@@ -8,9 +8,10 @@ export interface AnthropicContentBlock {
   data?: string;
   // image source
   source?: {
-    type: 'base64';
-    media_type: string;
-    data: string;
+    type: 'base64' | 'url';
+    media_type?: string;
+    data?: string;
+    url?: string;
   };
   // tool_use
   id?: string;
