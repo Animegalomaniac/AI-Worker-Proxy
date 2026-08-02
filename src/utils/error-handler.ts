@@ -88,10 +88,7 @@ export function isRetryableError(error: unknown): boolean {
  * Single source of truth for "is this failure worth rotating to the next API key".
  * Returns true → try next key; false → give up on this provider.
  */
-export function shouldRotateKey(
-  statusCode: number | undefined,
-  errorMessage?: string
-): boolean {
+export function shouldRotateKey(statusCode: number | undefined, errorMessage?: string): boolean {
   if (statusCode !== undefined && [429, 502, 503, 504, 408].includes(statusCode)) {
     return true;
   }
