@@ -6,6 +6,7 @@ import {
   createErrorResponse,
   withTimeout,
   isRetryableError,
+  shouldRotateKey,
 } from './utils/error-handler';
 import { createProvider } from './providers';
 import { AnthropicProvider } from './providers/anthropic';
@@ -205,8 +206,7 @@ async function handleAnthropicNativePath(
         const result = await withTimeout(provider.nativeChat(body, apiKey), timeoutMs);
         if (!result.success) {
           lastError = result.error;
-          // Keep in sync with isRetryableError in utils/error-handler.ts
-          if (result.statusCode && ![429, 502, 503, 504, 408].includes(result.statusCode)) {
+          if (!shouldRotateKey(result.statusCode, result.error)) {
             break;
           }
           continue;

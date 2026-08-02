@@ -1,6 +1,6 @@
 import { ProviderConfig, Env, OpenAIChatRequest, ProviderResponse } from './types';
 import { createProvider } from './providers';
-import { isRetryableError, withTimeout } from './utils/error-handler';
+import { isRetryableError, shouldRotateKey, withTimeout } from './utils/error-handler';
 
 export class TokenManager {
   constructor(
@@ -63,12 +63,7 @@ export class TokenManager {
         console.log(`[TokenManager] Failed with key ${i + 1}/${apiKeys.length}: ${response.error}`);
 
         // If it's not a retryable error, don't try other keys for this provider
-        // (connection-level failures surface as 500 + message — check the message too)
-        if (
-          response.statusCode &&
-          !this.isRetryableStatusCode(response.statusCode) &&
-          !isRetryableError({ message: response.error })
-        ) {
+        if (!shouldRotateKey(response.statusCode, response.error)) {
           break;
         }
       } catch (error) {
@@ -111,16 +106,5 @@ export class TokenManager {
     }
 
     return keys;
-  }
-
-  private isRetryableStatusCode(statusCode: number): boolean {
-    // Keep in sync with isRetryableError in utils/error-handler.ts
-    return (
-      statusCode === 429 ||
-      statusCode === 503 ||
-      statusCode === 502 ||
-      statusCode === 504 ||
-      statusCode === 408
-    );
   }
 }

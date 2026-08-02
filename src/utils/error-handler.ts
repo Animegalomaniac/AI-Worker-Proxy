@@ -85,6 +85,20 @@ export function isRetryableError(error: unknown): boolean {
 }
 
 /**
+ * Single source of truth for "is this failure worth rotating to the next API key".
+ * Returns true → try next key; false → give up on this provider.
+ */
+export function shouldRotateKey(
+  statusCode: number | undefined,
+  errorMessage?: string
+): boolean {
+  if (statusCode !== undefined && [429, 502, 503, 504, 408].includes(statusCode)) {
+    return true;
+  }
+  return isRetryableError({ message: errorMessage });
+}
+
+/**
  * Default timeout for external API calls (milliseconds).
  * Non-streaming completions with large max_tokens routinely take 30–60s+, so a
  * short timeout kills legitimate requests (waiting on upstream I/O does not count

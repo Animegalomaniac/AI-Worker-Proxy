@@ -47,6 +47,11 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
           pendingToolCalls.length = 0;
         }
       };
+      // tool_result blocks are deferred and emitted at the end of the message,
+      // BEFORE any text content. OpenAI requires tool messages to immediately
+      // follow the assistant tool_calls message — pushing user text first
+      // (when blocks are ordered [text, tool_result]) breaks that adjacency.
+      const pendingToolResults: OpenAIMessage[] = [];
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
           flushToolCalls();
@@ -80,14 +85,12 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
                     .map((c) => c.text)
                     .join(' ')
                 : '';
-          flushToolCalls();
-          flushContentParts();
-          messages.push({
+          pendingToolResults.push({
             role: 'tool',
             tool_call_id: block.tool_use_id || '',
             content: toolContent,
           });
-          continue; // Already pushed, skip the main push below
+          continue; // Deferred, skip the main push below
         } else if (block.type === 'tool_use' && block.name) {
           // Tool use from assistant messages — accumulate so parallel calls
           // share one assistant message (flushed by flushToolCalls)
@@ -103,6 +106,9 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
           continue; // Accumulated, skip the main push below
         }
       }
+      // tool messages must come first so they stay adjacent to the preceding
+      // assistant tool_calls message; user text content follows after.
+      messages.push(...pendingToolResults);
       flushContentParts();
       flushToolCalls();
     }

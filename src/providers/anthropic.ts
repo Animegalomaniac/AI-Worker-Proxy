@@ -436,6 +436,22 @@ export class AnthropicProvider extends BaseProvider {
       }
     }
 
-    return { system, messages: convertedMessages };
+    // Anthropic requires strict user/assistant alternation. Parallel tool calls
+    // arrive as consecutive OpenAI 'tool' messages, each converted above to its
+    // own 'user' message — merge any consecutive same-role messages into one so
+    // the API doesn't reject the conversation with "roles must alternate".
+    type ContentBlocks = Exclude<Anthropic.MessageParam['content'], string>;
+    const merged: Anthropic.MessageParam[] = [];
+    for (const m of convertedMessages) {
+      const blocks = m.content as ContentBlocks;
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role) {
+        (last.content as ContentBlocks).push(...blocks);
+      } else {
+        merged.push({ role: m.role, content: [...blocks] });
+      }
+    }
+
+    return { system, messages: merged };
   }
 }
