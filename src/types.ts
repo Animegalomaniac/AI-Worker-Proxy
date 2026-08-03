@@ -59,7 +59,7 @@ export interface OpenAIChatRequest {
   max_tokens?: number;
   stream?: boolean;
   tools?: Tool[];
-  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
+  tool_choice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
   top_p?: number;
   frequency_penalty?: number;
   presence_penalty?: number;

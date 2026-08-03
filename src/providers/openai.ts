@@ -8,6 +8,8 @@ export class OpenAIProvider extends BaseProvider {
       const client = new OpenAI({
         apiKey,
         baseURL: this.baseUrl,
+        // Retries are owned by the outer TokenManager/Router rotation
+        maxRetries: 0,
       });
 
       const params:
@@ -66,6 +68,12 @@ export class OpenAIProvider extends BaseProvider {
       } catch (error) {
         console.error('[OpenAIProvider] Stream error:', error);
         try {
+          // Notify client of error before closing
+          await writer.write(
+            encoder.encode(
+              `data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`
+            )
+          );
           // Send a clean finish so the client doesn't hang
           const errorFinish = {
             id: 'chatcmpl-error',

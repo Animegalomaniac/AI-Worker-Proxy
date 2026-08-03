@@ -1,5 +1,12 @@
 import { AnthropicRequest, AnthropicResponse, AnthropicContentBlock } from '../anthropic-types';
-import { OpenAIChatRequest, OpenAIChatResponse, OpenAIMessage, ContentPart } from '../types';
+import {
+  OpenAIChatRequest,
+  OpenAIChatResponse,
+  OpenAIMessage,
+  ContentPart,
+  ToolCall,
+} from '../types';
+import { ProxyError } from './error-handler';
 
 /**
  * Convert an Anthropic-format request to OpenAI-format request.
@@ -20,17 +27,52 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
     } else {
       // Content is an array of blocks
       const contentParts: ContentPart[] = [];
+      const flushContentParts = () => {
+        if (contentParts.length > 0) {
+          if (contentParts.length === 1 && contentParts[0].type === 'text') {
+            messages.push({ role: msg.role, content: contentParts[0].text });
+          } else {
+            messages.push({ role: msg.role, content: [...contentParts] });
+          }
+          contentParts.length = 0;
+        }
+      };
+      // Accumulate consecutive tool_use blocks into one assistant message —
+      // OpenAI requires tool messages to directly follow a single assistant
+      // tool_calls message, so parallel calls must not be split apart.
+      const pendingToolCalls: ToolCall[] = [];
+      const flushToolCalls = () => {
+        if (pendingToolCalls.length > 0) {
+          messages.push({ role: msg.role, content: null, tool_calls: [...pendingToolCalls] });
+          pendingToolCalls.length = 0;
+        }
+      };
+      // tool_result blocks are deferred and emitted at the end of the message,
+      // BEFORE any text content. OpenAI requires tool messages to immediately
+      // follow the assistant tool_calls message — pushing user text first
+      // (when blocks are ordered [text, tool_result]) breaks that adjacency.
+      const pendingToolResults: OpenAIMessage[] = [];
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
+          flushToolCalls();
           contentParts.push({ type: 'text', text: block.text });
         } else if (block.type === 'image' && block.source) {
+          flushToolCalls();
           // Convert Anthropic image block to OpenAI image_url format
-          contentParts.push({
-            type: 'image_url',
-            image_url: {
-              url: `data:${block.source.media_type};base64,${block.source.data}`,
-            },
-          });
+          if (block.source.type === 'url' && block.source.url) {
+            // URL-source image — pass through directly
+            contentParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+          } else if (block.source.media_type && block.source.data) {
+            // Base64 image — convert to OpenAI data URI
+            contentParts.push({
+              type: 'image_url',
+              image_url: {
+                url: `data:${block.source.media_type};base64,${block.source.data}`,
+              },
+            });
+          }
+          // Malformed source (missing fields) — skip silently rather than
+          // emitting a garbage `data:undefined;base64,undefined` URI
         } else if (block.type === 'tool_result') {
           // Tool results in Anthropic are content blocks in user messages;
           // in OpenAI they are separate messages with role 'tool'
@@ -43,40 +85,32 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
                     .map((c) => c.text)
                     .join(' ')
                 : '';
-          messages.push({
+          pendingToolResults.push({
             role: 'tool',
             tool_call_id: block.tool_use_id || '',
             content: toolContent,
           });
-          continue; // Already pushed, skip the main push below
+          continue; // Deferred, skip the main push below
         } else if (block.type === 'tool_use' && block.name) {
-          // Tool use from assistant messages
-          messages.push({
-            role: msg.role,
-            content: null,
-            tool_calls: [
-              {
-                id: block.id || '',
-                type: 'function',
-                function: {
-                  name: block.name,
-                  arguments: JSON.stringify(block.input),
-                },
-              },
-            ],
+          // Tool use from assistant messages — accumulate so parallel calls
+          // share one assistant message (flushed by flushToolCalls)
+          flushContentParts();
+          pendingToolCalls.push({
+            id: block.id || '',
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: JSON.stringify(block.input ?? {}),
+            },
           });
-          continue; // Already pushed
+          continue; // Accumulated, skip the main push below
         }
       }
-      if (contentParts.length > 0) {
-        // Pure single text part — keep as string for backward compatibility
-        if (contentParts.length === 1 && contentParts[0].type === 'text') {
-          messages.push({ role: msg.role, content: contentParts[0].text });
-        } else {
-          // Has images or mixed content — use structured array format
-          messages.push({ role: msg.role, content: contentParts });
-        }
-      }
+      // tool messages must come first so they stay adjacent to the preceding
+      // assistant tool_calls message; user text content follows after.
+      messages.push(...pendingToolResults);
+      flushContentParts();
+      flushToolCalls();
     }
   }
 
@@ -101,6 +135,22 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
         parameters: tool.input_schema || {},
       },
     }));
+  }
+
+  // Map Anthropic tool_choice to OpenAI tool_choice
+  if (anthropicReq.tool_choice) {
+    const tc = anthropicReq.tool_choice;
+    if (tc.type === 'auto') {
+      openAIReq.tool_choice = 'auto';
+    } else if (tc.type === 'any') {
+      // Anthropic 'any' forces tool use — the OpenAI equivalent is 'required', not 'auto'
+      openAIReq.tool_choice = 'required';
+    } else if (tc.type === 'tool' && tc.name) {
+      openAIReq.tool_choice = {
+        type: 'function',
+        function: { name: tc.name },
+      };
+    }
   }
 
   return openAIReq;
@@ -131,7 +181,10 @@ export function convertOpenAIResponseToAnthropic(
   openaiResp: OpenAIChatResponse,
   model: string
 ): AnthropicResponse {
-  const choice = openaiResp.choices[0];
+  const choice = openaiResp.choices?.[0];
+  if (!choice) {
+    throw new ProxyError('Provider returned a response with no choices', 502);
+  }
   const message = choice.message;
   const content: AnthropicContentBlock[] = [];
 
@@ -183,13 +236,18 @@ export function convertOpenAIResponseToAnthropic(
  */
 export class AnthropicStreamAdapter {
   private encoder = new TextEncoder();
+  private decoder = new TextDecoder();
   /** Monotonically increasing counter for the next content block index */
   private blockIndex = 0;
   /** Index of the currently active content block (used by stopBlock and deltas) */
   private activeBlockIndex = 0;
   private started = false;
+  /** Set once a finish_reason chunk has been processed */
+  private finished = false;
   private textBlockActive = false;
   private toolBlockActive = false;
+  /** Maps OpenAI tool call index → Anthropic content block index */
+  private toolBlockIndexMap = new Map<number, number>();
 
   constructor(
     private model: string,
@@ -248,7 +306,7 @@ export class AnthropicStreamAdapter {
     return new TransformStream({
       transform: (chunk, controller) => {
         // Use { stream: true } for proper multi-byte UTF-8 handling across chunks
-        const text = lineBuffer + new TextDecoder().decode(chunk, { stream: true });
+        const text = lineBuffer + this.decoder.decode(chunk, { stream: true });
         const lines = text.split('\n');
 
         // Last element may be a partial line — keep it in the buffer for the next chunk
@@ -264,6 +322,21 @@ export class AnthropicStreamAdapter {
           this.processSSELine(lineBuffer, controller, currentToolIndex);
         }
         lineBuffer = '';
+        // Upstream ended without a finish_reason chunk — close gracefully so
+        // Anthropic clients don't hang waiting for message_stop
+        if (this.started && !this.finished) {
+          if (this.textBlockActive || this.toolBlockActive) {
+            this.stopBlock(controller);
+          }
+          controller.enqueue(
+            this.encodeSSE('message_delta', {
+              type: 'message_delta',
+              delta: { stop_reason: 'end_turn', stop_sequence: null },
+              usage: { output_tokens: 0 },
+            })
+          );
+          controller.enqueue(this.encodeSSE('message_stop', { type: 'message_stop' }));
+        }
       },
     });
   }
@@ -288,10 +361,34 @@ export class AnthropicStreamAdapter {
       return toolIndex;
     }
 
+    // Upstream-injected error (provider stream catch blocks) — surface it to
+    // the client instead of letting the following finish look like a clean end
+    if (parsed.error) {
+      if (!this.started) {
+        this.started = true;
+        this.startMessage(controller);
+      }
+      controller.enqueue(
+        this.encodeSSE('error', {
+          type: 'error',
+          error: {
+            type: 'stream_error',
+            message:
+              typeof parsed.error.message === 'string'
+                ? parsed.error.message
+                : 'Upstream stream error',
+          },
+        })
+      );
+      return toolIndex;
+    }
+
     const choice = parsed.choices?.[0];
     if (!choice) return toolIndex;
 
-    const { delta, finish_reason } = choice;
+    // Some OpenAI-compatible providers omit `delta` on the final chunk
+    const delta = choice.delta ?? {};
+    const finish_reason = choice.finish_reason;
     let currentToolIndex = toolIndex;
 
     // Start message on first chunk
@@ -301,8 +398,13 @@ export class AnthropicStreamAdapter {
     }
 
     // Text content delta
-    if (delta.content !== undefined && delta.content !== null) {
-      if (!this.textBlockActive && !this.toolBlockActive) {
+    if (delta.content) {
+      // Text arrived while a tool block is active (e.g. Gemini interleaves
+      // text after function calls) — close it and start a fresh text block
+      if (this.toolBlockActive) {
+        this.stopBlock(controller);
+      }
+      if (!this.textBlockActive) {
         this.startTextBlock(controller);
       }
       controller.enqueue(
@@ -326,6 +428,9 @@ export class AnthropicStreamAdapter {
           currentToolIndex++;
           this.activeBlockIndex = this.blockIndex++;
           this.toolBlockActive = true;
+          if (tc.index !== undefined) {
+            this.toolBlockIndexMap.set(tc.index, this.activeBlockIndex);
+          }
 
           controller.enqueue(
             this.encodeSSE('content_block_start', {
@@ -342,10 +447,14 @@ export class AnthropicStreamAdapter {
         }
 
         if (tc.function?.arguments !== undefined) {
+          const blockIdx =
+            tc.index !== undefined
+              ? (this.toolBlockIndexMap.get(tc.index) ?? this.activeBlockIndex)
+              : this.activeBlockIndex;
           controller.enqueue(
             this.encodeSSE('content_block_delta', {
               type: 'content_block_delta',
-              index: this.activeBlockIndex,
+              index: blockIdx,
               delta: {
                 type: 'input_json_delta',
                 partial_json: tc.function.arguments,
@@ -358,6 +467,7 @@ export class AnthropicStreamAdapter {
 
     // Finish reason
     if (finish_reason) {
+      this.finished = true;
       if (this.textBlockActive || this.toolBlockActive) {
         this.stopBlock(controller);
       }

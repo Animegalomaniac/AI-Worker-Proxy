@@ -72,6 +72,7 @@ export class Router {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let lastError: any = null;
+    let lastStatusCode: number | undefined;
 
     // Try each provider in order
     for (let i = 0; i < orderedProviders.length; i++) {
@@ -90,20 +91,31 @@ export class Router {
         }
 
         lastError = response.error;
+        if (response.statusCode) {
+          lastStatusCode = response.statusCode;
+        }
         console.log(
           `[Router] Provider ${config.provider}/${config.model} failed: ${response.error}`
         );
       } catch (error) {
         lastError = error;
+        const status =
+          (error as { status?: number; statusCode?: number } | null)?.status ??
+          (error as { statusCode?: number } | null)?.statusCode;
+        if (status) {
+          lastStatusCode = status;
+        }
         console.error(`[Router] Provider ${config.provider}/${config.model} exception:`, error);
       }
     }
 
-    // All providers failed
+    // All providers failed — propagate the last upstream status code instead of
+    // always returning 500, so clients can tell bad requests (400) and bad keys
+    // (401) apart from proxy failures.
     return {
       success: false,
       error: `All providers failed. Last error: ${lastError?.message || lastError || 'Unknown error'}`,
-      statusCode: 500,
+      statusCode: lastStatusCode ?? 500,
     };
   }
 

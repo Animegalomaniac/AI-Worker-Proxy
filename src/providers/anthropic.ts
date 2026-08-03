@@ -7,7 +7,9 @@ import { createOpenAIResponse, StreamSession } from '../utils/response-mapper';
 export class AnthropicProvider extends BaseProvider {
   async chat(request: OpenAIChatRequest, apiKey: string): Promise<ProviderResponse> {
     try {
-      const clientOpts: Record<string, unknown> = { apiKey };
+      // Retries are owned by the outer TokenManager/Router rotation — disable
+      // the SDK's built-in retry to avoid request amplification (3x per key).
+      const clientOpts: Record<string, unknown> = { apiKey, maxRetries: 0 };
       if (this.baseUrl) {
         clientOpts.baseURL = this.baseUrl;
       }
@@ -50,6 +52,9 @@ export class AnthropicProvider extends BaseProvider {
           params.tool_choice = { type: 'none' };
         } else if (request.tool_choice === 'auto') {
           params.tool_choice = { type: 'auto' };
+        } else if (request.tool_choice === 'required') {
+          // OpenAI 'required' (must call a tool) ↔ Anthropic 'any'
+          params.tool_choice = { type: 'any' };
         } else if (
           typeof request.tool_choice === 'object' &&
           request.tool_choice.type === 'function'
@@ -76,14 +81,16 @@ export class AnthropicProvider extends BaseProvider {
    */
   async nativeChat(request: AnthropicRequest, apiKey: string): Promise<ProviderResponse> {
     try {
-      const clientOpts: Record<string, unknown> = { apiKey };
+      // Retries are owned by the outer TokenManager/Router rotation — disable
+      // the SDK's built-in retry to avoid request amplification (3x per key).
+      const clientOpts: Record<string, unknown> = { apiKey, maxRetries: 0 };
       if (this.baseUrl) {
         clientOpts.baseURL = this.baseUrl;
       }
       const client = new Anthropic(clientOpts);
 
       const params: Record<string, unknown> = {
-        model: request.model,
+        model: this.model,
         messages: request.messages,
         max_tokens: request.max_tokens ?? 4096,
         stream: request.stream || false,
@@ -121,33 +128,61 @@ export class AnthropicProvider extends BaseProvider {
     let content = '';
     let toolCalls: ToolCall[] | undefined;
 
-    for (const block of response.content) {
-      if (block.type === 'text') {
-        content += block.text;
-      } else if (block.type === 'tool_use') {
+    for (const rawBlock of response.content) {
+      const block = rawBlock as unknown as Record<string, unknown>;
+      const blockType = block.type as string;
+      if (blockType === 'thinking' || blockType === 'redacted_thinking') {
+        const label = blockType === 'thinking' ? 'thinking' : 'redacted_thinking';
+        const thinkingText = typeof block.thinking === 'string' ? block.thinking : '';
+        const dataText = typeof block.data === 'string' ? block.data : '';
+        content += `\n\n[${label}] ${thinkingText || dataText}[/${label}]\n\n`;
+      } else if (blockType === 'text') {
+        content += block.text as string;
+      } else if (blockType === 'tool_use') {
         if (!toolCalls) toolCalls = [];
         toolCalls.push({
-          id: block.id,
+          id: block.id as string,
           type: 'function',
           function: {
-            name: block.name,
-            arguments: JSON.stringify(block.input),
+            name: block.name as string,
+            arguments: JSON.stringify(block.input ?? {}),
           },
         });
       }
     }
 
-    const finishReason = response.stop_reason === 'tool_use' ? 'tool_calls' : 'stop';
+    const finishReason =
+      response.stop_reason === 'tool_use'
+        ? 'tool_calls'
+        : response.stop_reason === 'max_tokens'
+          ? 'length'
+          : 'stop';
+
+    const usage = response.usage
+      ? {
+          prompt_tokens: response.usage.input_tokens,
+          completion_tokens: response.usage.output_tokens,
+          total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+        }
+      : undefined;
 
     return {
       success: true,
-      response: createOpenAIResponse(content, this.model, finishReason, toolCalls),
+      response: createOpenAIResponse(content, this.model, finishReason, toolCalls, usage),
     };
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleStream(client: Anthropic, params: any): Promise<ProviderResponse> {
-    const stream = await client.messages.stream(params);
+    // Use messages.create({stream:true}) instead of messages.stream():
+    // create() awaits the upstream response, so connection-time errors (401/429/400)
+    // reject here and can trigger key rotation / provider fallback. messages.stream()
+    // is fire-and-forget — errors only surface mid-stream, after we've already
+    // reported success, which silently bypasses the whole failover chain.
+    const stream = await client.messages.create({
+      ...params,
+      stream: true,
+    } as Anthropic.MessageCreateParamsStreaming);
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const session = new StreamSession(this.model);
@@ -160,8 +195,12 @@ export class AnthropicProvider extends BaseProvider {
         // Track tool calls by index for proper incremental streaming
         let toolCallIndex = -1;
         let hasToolCalls = false;
+        // Anthropic reports the real stop reason in message_delta before message_stop
+        let stopReason: string | null = null;
 
-        for await (const event of stream) {
+        for await (const rawEvent of stream) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const event = rawEvent as any;
           if (event.type === 'content_block_start') {
             if (event.content_block.type === 'tool_use') {
               toolCallIndex++;
@@ -174,6 +213,11 @@ export class AnthropicProvider extends BaseProvider {
                   event.content_block.name
                 )
               );
+            } else if (
+              event.content_block.type === 'thinking' ||
+              event.content_block.type === 'redacted_thinking'
+            ) {
+              await writer.write(session.textChunk('\n[thinking]\n'));
             }
           } else if (event.type === 'content_block_delta') {
             if (event.delta.type === 'text_delta') {
@@ -185,9 +229,26 @@ export class AnthropicProvider extends BaseProvider {
                   session.toolCallArgsChunk(toolCallIndex, event.delta.partial_json)
                 );
               }
+            } else if (event.delta.type === 'thinking_delta') {
+              const thinking = event.delta.thinking;
+              if (typeof thinking === 'string') {
+                await writer.write(session.textChunk(thinking));
+              }
+            } else if (event.delta.type === 'signature_delta') {
+              // Signature delta — end thinking block
+              await writer.write(session.textChunk('\n[/thinking]\n'));
+            }
+          } else if (event.type === 'message_delta') {
+            const deltaStopReason = event.delta?.stop_reason;
+            if (typeof deltaStopReason === 'string') {
+              stopReason = deltaStopReason;
             }
           } else if (event.type === 'message_stop') {
-            const reason = hasToolCalls ? 'tool_calls' : 'stop';
+            const reason = hasToolCalls
+              ? 'tool_calls'
+              : stopReason === 'max_tokens'
+                ? 'length'
+                : 'stop';
             await writer.write(session.finishChunk(reason));
             await writer.write(session.done());
           }
@@ -195,6 +256,11 @@ export class AnthropicProvider extends BaseProvider {
       } catch (error) {
         console.error('[AnthropicProvider] Stream error:', error);
         try {
+          await writer.write(
+            new TextEncoder().encode(
+              `data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`
+            )
+          );
           await writer.write(session.finishChunk('stop'));
           await writer.write(session.done());
         } catch {
@@ -229,7 +295,12 @@ export class AnthropicProvider extends BaseProvider {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleNativeStream(client: Anthropic, params: any): Promise<ProviderResponse> {
-    const stream = await client.messages.stream(params);
+    // Same as handleStream: create({stream:true}) awaits the upstream response so
+    // connection-time errors reject here and failover/rotation still works.
+    const stream = await client.messages.create({
+      ...params,
+      stream: true,
+    } as Anthropic.MessageCreateParamsStreaming);
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -243,9 +314,16 @@ export class AnthropicProvider extends BaseProvider {
       } catch (error) {
         console.error('[AnthropicProvider] Native stream error:', error);
         try {
-          const errorEvent = { type: 'message_stop' };
+          const errorEvent = {
+            type: 'error',
+            error: { type: 'stream_error', message: 'Stream terminated due to upstream error' },
+          };
           await writer.write(
-            encoder.encode(`event: message_stop\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+            encoder.encode(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+          );
+          const stopEvent = { type: 'message_stop' };
+          await writer.write(
+            encoder.encode(`event: message_stop\ndata: ${JSON.stringify(stopEvent)}\n\n`)
           );
         } catch {
           // Writer may already be closed
@@ -271,12 +349,14 @@ export class AnthropicProvider extends BaseProvider {
 
     for (const msg of messages) {
       if (msg.role === 'system') {
-        system =
+        const text =
           typeof msg.content === 'string'
             ? msg.content
             : msg.content
               ? msg.content.map((p) => (p.type === 'text' ? p.text : '')).join(' ')
               : '';
+        // Multiple system messages: concatenate instead of overwriting
+        system = system ? `${system}\n\n${text}` : text;
       } else if (msg.role === 'user' || msg.role === 'assistant') {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const content: any[] = [];
@@ -289,18 +369,26 @@ export class AnthropicProvider extends BaseProvider {
               if (part.type === 'text') {
                 content.push({ type: 'text', text: part.text });
               } else if (part.type === 'image_url') {
-                // Parse data URI to extract mime type and base64 data
-                const dataUri = part.image_url.url;
-                const commaIdx = dataUri.indexOf(',');
-                if (commaIdx !== -1) {
-                  const header = dataUri.slice(0, commaIdx);
-                  const base64Data = dataUri.slice(commaIdx + 1);
-                  const mimeMatch = header.match(/^data:([^;]+)/);
-                  const mediaType = mimeMatch ? mimeMatch[1] : 'image/png';
+                const imageUrl = part.image_url.url;
+                if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+                  // Remote image URL — pass through using Anthropic's URL image source
                   content.push({
                     type: 'image',
-                    source: { type: 'base64', media_type: mediaType, data: base64Data },
+                    source: { type: 'url', url: imageUrl },
                   });
+                } else {
+                  // Parse data URI to extract mime type and base64 data
+                  const commaIdx = imageUrl.indexOf(',');
+                  if (commaIdx !== -1) {
+                    const header = imageUrl.slice(0, commaIdx);
+                    const base64Data = imageUrl.slice(commaIdx + 1);
+                    const mimeMatch = header.match(/^data:([^;]+)/);
+                    const mediaType = mimeMatch ? mimeMatch[1] : 'image/png';
+                    content.push({
+                      type: 'image',
+                      source: { type: 'base64', media_type: mediaType, data: base64Data },
+                    });
+                  }
                 }
               }
             }
@@ -348,6 +436,22 @@ export class AnthropicProvider extends BaseProvider {
       }
     }
 
-    return { system, messages: convertedMessages };
+    // Anthropic requires strict user/assistant alternation. Parallel tool calls
+    // arrive as consecutive OpenAI 'tool' messages, each converted above to its
+    // own 'user' message — merge any consecutive same-role messages into one so
+    // the API doesn't reject the conversation with "roles must alternate".
+    type ContentBlocks = Exclude<Anthropic.MessageParam['content'], string>;
+    const merged: Anthropic.MessageParam[] = [];
+    for (const m of convertedMessages) {
+      const blocks = m.content as ContentBlocks;
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role) {
+        (last.content as ContentBlocks).push(...blocks);
+      } else {
+        merged.push({ role: m.role, content: [...blocks] });
+      }
+    }
+
+    return { system, messages: merged };
   }
 }

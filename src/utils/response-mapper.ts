@@ -13,11 +13,13 @@ export function createOpenAIResponse(
   content: string,
   model: string,
   finishReason: 'stop' | 'length' | 'tool_calls' = 'stop',
-  toolCalls?: ToolCall[]
+  toolCalls?: ToolCall[],
+  usage?: OpenAIChatResponse['usage']
 ): OpenAIChatResponse {
   const message: OpenAIMessage = {
     role: 'assistant',
-    content: toolCalls ? null : content,
+    // Preserve text when present even alongside tool calls (Claude/Gemini emit both)
+    content: toolCalls ? content || null : content,
   };
 
   if (toolCalls && toolCalls.length > 0) {
@@ -36,6 +38,7 @@ export function createOpenAIResponse(
         finish_reason: finishReason,
       },
     ],
+    usage,
   };
 }
 
@@ -128,23 +131,5 @@ export class StreamSession {
   /** [DONE] sentinel */
   done(): Uint8Array {
     return this.encoder.encode('data: [DONE]\n\n');
-  }
-
-  /** Write an SSE error comment (non-standard but helpful for debugging) */
-  errorChunk(_message: string): Uint8Array {
-    const payload = {
-      id: this.id,
-      object: 'chat.completion.chunk',
-      created: this.created,
-      model: this.model,
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: 'stop',
-        },
-      ],
-    };
-    return this.encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
   }
 }

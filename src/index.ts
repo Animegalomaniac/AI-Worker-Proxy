@@ -6,6 +6,7 @@ import {
   createErrorResponse,
   withTimeout,
   isRetryableError,
+  shouldRotateKey,
 } from './utils/error-handler';
 import { createProvider } from './providers';
 import { AnthropicProvider } from './providers/anthropic';
@@ -42,18 +43,24 @@ export default {
         });
       }
 
-      // Models list — no auth required (matches OpenAI behavior)
-      if ((path === '/models' || path === '/v1/models') && request.method === 'GET') {
+      // Everything below requires auth
+      if (!verifyAuth(request, env)) {
+        throw new ProxyError('Unauthorized', 401, 'invalid_auth');
+      }
+
+      // Models list (requires auth, matching OpenAI behavior)
+      if (
+        request.method === 'GET' &&
+        (path === '/models' ||
+          path === '/v1/models' ||
+          path === '/anthropic/models' ||
+          path === '/anthropic/v1/models')
+      ) {
         const router = new Router(env);
         return json({
           object: 'list',
           data: router.getAvailableModels(),
         });
-      }
-
-      // Everything below requires auth
-      if (!verifyAuth(request, env)) {
-        throw new ProxyError('Unauthorized', 401, 'invalid_auth');
       }
 
       // Anthropic-format chat completions — POST only
@@ -171,7 +178,18 @@ async function handleAnthropicNativePath(
       continue;
     }
 
-    const provider = createProvider(config, env) as AnthropicProvider;
+    let provider: AnthropicProvider;
+    try {
+      provider = createProvider(config, env) as AnthropicProvider;
+    } catch (error) {
+      // Bad config (e.g. missing baseUrl) — skip this provider, don't abort the loop
+      console.error(
+        `[AnthropicNativePath] Failed to create provider ${config.provider}/${config.model}:`,
+        error
+      );
+      lastError = error;
+      continue;
+    }
     const apiKeys = resolveApiKeys(config, env);
 
     if (apiKeys.length === 0) {
@@ -184,10 +202,11 @@ async function handleAnthropicNativePath(
 
     for (const apiKey of apiKeys) {
       try {
-        const result = await withTimeout(provider.nativeChat(body, apiKey));
+        const timeoutMs = Number(env.PROVIDER_TIMEOUT_MS) || undefined;
+        const result = await withTimeout(provider.nativeChat(body, apiKey), timeoutMs);
         if (!result.success) {
           lastError = result.error;
-          if (result.statusCode && ![429, 502, 503].includes(result.statusCode)) {
+          if (!shouldRotateKey(result.statusCode, result.error)) {
             break;
           }
           continue;
@@ -279,23 +298,41 @@ function json(data: unknown, status = 200): Response {
 }
 
 function verifyAuth(request: Request, env: Env): boolean {
+  if (!env.PROXY_AUTH_TOKEN) {
+    console.error('[verifyAuth] PROXY_AUTH_TOKEN not configured — rejecting all requests');
+    return false;
+  }
+
   // OpenAI-style: Authorization: Bearer <token>
   const authHeader = request.headers.get('Authorization');
   if (authHeader) {
     const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    if (token === env.PROXY_AUTH_TOKEN) return true;
+    if (constantTimeEqual(token, env.PROXY_AUTH_TOKEN)) return true;
   }
 
   // Anthropic-style: x-api-key: <token>
   const apiKey = request.headers.get('x-api-key');
-  if (apiKey && apiKey === env.PROXY_AUTH_TOKEN) return true;
+  if (apiKey !== null && constantTimeEqual(apiKey, env.PROXY_AUTH_TOKEN)) return true;
 
   return false;
 }
 
+/**
+ * Constant-time string comparison for the shared secret token.
+ * Length inequality still short-circuits — acceptable for a fixed-length token.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 function resolveApiKeys(config: ProviderConfig, env: Env): string[] {
   const keys: string[] = [];
-  for (const keyName of config.apiKeys) {
+  for (const keyName of config.apiKeys ?? []) {
     const value = env[keyName];
     if (value) {
       keys.push(value);

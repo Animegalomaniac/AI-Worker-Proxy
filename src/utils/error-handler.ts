@@ -71,16 +71,37 @@ export function isRetryableError(error: unknown): boolean {
     e.statusCode === 503 ||
     e.status === 502 ||
     e.statusCode === 502 ||
+    e.status === 504 ||
+    e.statusCode === 504 ||
+    e.status === 408 ||
+    e.statusCode === 408 ||
     (typeof e.message === 'string' && e.message.toLowerCase().includes('timeout')) ||
-    (typeof e.message === 'string' && e.message.toLowerCase().includes('overloaded'))
+    (typeof e.message === 'string' && e.message.toLowerCase().includes('overloaded')) ||
+    // Connection-level failures (SDK APIConnectionError, Workers fetch errors) carry
+    // no HTTP status — recognize them so key rotation can absorb transient blips
+    (typeof e.message === 'string' &&
+      /connection|fetch failed|econnreset|etimedout|socket hang up/i.test(e.message))
   );
 }
 
 /**
- * Default timeout for external API calls (milliseconds).
- * Cloudflare Workers free plan has a 30s CPU limit — leaving 5s for proxy overhead.
+ * Single source of truth for "is this failure worth rotating to the next API key".
+ * Returns true → try next key; false → give up on this provider.
  */
-const PROVIDER_TIMEOUT_MS = 25000;
+export function shouldRotateKey(statusCode: number | undefined, errorMessage?: string): boolean {
+  if (statusCode !== undefined && [429, 502, 503, 504, 408].includes(statusCode)) {
+    return true;
+  }
+  return isRetryableError({ message: errorMessage });
+}
+
+/**
+ * Default timeout for external API calls (milliseconds).
+ * Non-streaming completions with large max_tokens routinely take 30–60s+, so a
+ * short timeout kills legitimate requests (waiting on upstream I/O does not count
+ * against the Workers CPU limit). Override with the PROVIDER_TIMEOUT_MS env var.
+ */
+const PROVIDER_TIMEOUT_MS = 120000;
 
 /**
  * Wrap a promise with a timeout, throwing on expiry.

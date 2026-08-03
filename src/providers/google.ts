@@ -113,11 +113,27 @@ export class GoogleProvider extends BaseProvider {
       }
     }
 
-    const finishReason = toolCalls ? 'tool_calls' : 'stop';
+    const candidateFinish = response.candidates?.[0]?.finishReason as string | undefined;
+    const finishReason = toolCalls
+      ? 'tool_calls'
+      : candidateFinish === 'MAX_TOKENS'
+        ? 'length'
+        : 'stop';
+
+    const usageMeta = response.usageMetadata;
+    const usage = usageMeta
+      ? {
+          prompt_tokens: usageMeta.promptTokenCount ?? 0,
+          completion_tokens: usageMeta.candidatesTokenCount ?? 0,
+          total_tokens:
+            usageMeta.totalTokenCount ??
+            (usageMeta.promptTokenCount ?? 0) + (usageMeta.candidatesTokenCount ?? 0),
+        }
+      : undefined;
 
     return {
       success: true,
-      response: createOpenAIResponse(content, this.model, finishReason, toolCalls),
+      response: createOpenAIResponse(content, this.model, finishReason, toolCalls, usage),
     };
   }
 
@@ -135,11 +151,16 @@ export class GoogleProvider extends BaseProvider {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const session = new StreamSession(this.model);
+    const encoder = new TextEncoder();
 
     (async () => {
       try {
         await writer.write(session.roleChunk());
         let hasToolCalls = false;
+        // Cumulative tool call index — must not restart per chunk, or parallel
+        // calls arriving in different chunks collide on the same index
+        let toolCallCount = 0;
+        let lastFinishReason: string | undefined;
 
         for await (const chunk of response) {
           // Text content
@@ -147,29 +168,45 @@ export class GoogleProvider extends BaseProvider {
             await writer.write(session.textChunk(chunk.text));
           }
 
+          const candidate = chunk.candidates?.[0];
+          if (candidate?.finishReason) {
+            lastFinishReason = candidate.finishReason as string;
+          }
+
           // Function calls
-          const parts = chunk.candidates?.[0]?.content?.parts;
+          const parts = candidate?.content?.parts;
           if (parts) {
             const fcParts = parts.filter((p: Part) => p.functionCall);
-            for (let i = 0; i < fcParts.length; i++) {
-              const p = fcParts[i];
+            for (const p of fcParts) {
               hasToolCalls = true;
+              const index = toolCallCount++;
               const callId = encodeToolCallId(
                 (p as Record<string, unknown>).thoughtSignature as string
               );
-              await writer.write(session.toolCallStartChunk(i, callId, p.functionCall!.name || ''));
               await writer.write(
-                session.toolCallArgsChunk(i, JSON.stringify(p.functionCall!.args || {}))
+                session.toolCallStartChunk(index, callId, p.functionCall!.name || '')
+              );
+              await writer.write(
+                session.toolCallArgsChunk(index, JSON.stringify(p.functionCall!.args || {}))
               );
             }
           }
         }
 
-        await writer.write(session.finishChunk(hasToolCalls ? 'tool_calls' : 'stop'));
+        await writer.write(
+          session.finishChunk(
+            hasToolCalls ? 'tool_calls' : lastFinishReason === 'MAX_TOKENS' ? 'length' : 'stop'
+          )
+        );
         await writer.write(session.done());
       } catch (error) {
         console.error('[GoogleProvider] Stream error:', error);
         try {
+          await writer.write(
+            encoder.encode(
+              `data: ${JSON.stringify({ error: { message: 'Stream terminated due to upstream error', type: 'stream_error' } })}\n\n`
+            )
+          );
           await writer.write(session.finishChunk('stop'));
           await writer.write(session.done());
         } catch {
@@ -210,12 +247,14 @@ export class GoogleProvider extends BaseProvider {
 
     for (const msg of messages) {
       if (msg.role === 'system') {
-        systemInstruction =
+        const text =
           typeof msg.content === 'string'
             ? msg.content || ''
             : msg.content
               ? msg.content.map((p) => (p.type === 'text' ? p.text : '')).join(' ')
               : '';
+        // Multiple system messages: concatenate instead of overwriting
+        systemInstruction = systemInstruction ? `${systemInstruction}\n\n${text}` : text;
       } else if (msg.role === 'user') {
         const parts: Part[] = [];
         if (typeof msg.content === 'string') {
@@ -225,8 +264,16 @@ export class GoogleProvider extends BaseProvider {
             if (part.type === 'text') {
               parts.push({ text: part.text });
             } else if (part.type === 'image_url') {
-              // Parse data URI to extract mime type and base64 data
               const dataUri = part.image_url.url;
+              if (dataUri.startsWith('http://') || dataUri.startsWith('https://')) {
+                // Gemini inlineData requires base64 — remote URLs can't be passed through
+                console.warn(
+                  '[GoogleProvider] Remote image URL dropped (not supported):',
+                  dataUri.slice(0, 100)
+                );
+                continue;
+              }
+              // Parse data URI to extract mime type and base64 data
               const commaIdx = dataUri.indexOf(',');
               if (commaIdx !== -1) {
                 const header = dataUri.slice(0, commaIdx);
@@ -260,10 +307,17 @@ export class GoogleProvider extends BaseProvider {
 
         if (msg.tool_calls) {
           for (const toolCall of msg.tool_calls) {
+            let parsedArgs: unknown;
+            try {
+              parsedArgs = JSON.parse(toolCall.function.arguments);
+            } catch {
+              // Fall back to empty object if arguments are not valid JSON
+              parsedArgs = {};
+            }
             const part: Record<string, unknown> = {
               functionCall: {
                 name: toolCall.function.name,
-                args: JSON.parse(toolCall.function.arguments),
+                args: parsedArgs,
               },
             };
             // Restore thought signature from encoded tool call ID
