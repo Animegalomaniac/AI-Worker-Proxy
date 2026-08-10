@@ -27,37 +27,20 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
     } else {
       // Content is an array of blocks
       const contentParts: ContentPart[] = [];
-      const flushContentParts = () => {
-        if (contentParts.length > 0) {
-          if (contentParts.length === 1 && contentParts[0].type === 'text') {
-            messages.push({ role: msg.role, content: contentParts[0].text });
-          } else {
-            messages.push({ role: msg.role, content: [...contentParts] });
-          }
-          contentParts.length = 0;
-        }
-      };
-      // Accumulate consecutive tool_use blocks into one assistant message —
-      // OpenAI requires tool messages to directly follow a single assistant
-      // tool_calls message, so parallel calls must not be split apart.
-      const pendingToolCalls: ToolCall[] = [];
-      const flushToolCalls = () => {
-        if (pendingToolCalls.length > 0) {
-          messages.push({ role: msg.role, content: null, tool_calls: [...pendingToolCalls] });
-          pendingToolCalls.length = 0;
-        }
-      };
-      // tool_result blocks are deferred and emitted at the end of the message,
-      // BEFORE any text content. OpenAI requires tool messages to immediately
-      // follow the assistant tool_calls message — pushing user text first
-      // (when blocks are ordered [text, tool_result]) breaks that adjacency.
-      const pendingToolResults: OpenAIMessage[] = [];
+      // Accumulate text, tool_use, and tool_result blocks separately, then
+      // emit them in a fixed order. Text and tool_use from one source
+      // assistant message must stay in ONE OpenAI assistant message (content
+      // may coexist with tool_calls), otherwise an intermediate assistant
+      // message ends up between the tool_calls message and its tool result
+      // messages, which OpenAI rejects with
+      // "messages with role 'tool' must be a response to a preceding message
+      // with 'tool_calls'".
+      const toolCalls: ToolCall[] = [];
+      const toolResults: OpenAIMessage[] = [];
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
-          flushToolCalls();
           contentParts.push({ type: 'text', text: block.text });
         } else if (block.type === 'image' && block.source) {
-          flushToolCalls();
           // Convert Anthropic image block to OpenAI image_url format
           if (block.source.type === 'url' && block.source.url) {
             // URL-source image — pass through directly
@@ -85,17 +68,14 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
                     .map((c) => c.text)
                     .join(' ')
                 : '';
-          pendingToolResults.push({
+          toolResults.push({
             role: 'tool',
             tool_call_id: block.tool_use_id || '',
             content: toolContent,
           });
-          continue; // Deferred, skip the main push below
         } else if (block.type === 'tool_use' && block.name) {
-          // Tool use from assistant messages — accumulate so parallel calls
-          // share one assistant message (flushed by flushToolCalls)
-          flushContentParts();
-          pendingToolCalls.push({
+          // Accumulate so parallel calls share one assistant message
+          toolCalls.push({
             id: block.id || '',
             type: 'function',
             function: {
@@ -103,14 +83,31 @@ export function convertAnthropicRequestToOpenAI(anthropicReq: AnthropicRequest):
               arguments: JSON.stringify(block.input ?? {}),
             },
           });
-          continue; // Accumulated, skip the main push below
         }
+      }
+
+      const serializeContent = (): string | ContentPart[] | null =>
+        contentParts.length === 0
+          ? null
+          : contentParts.length === 1 && contentParts[0].type === 'text'
+            ? contentParts[0].text
+            : contentParts;
+
+      // One source assistant message maps to exactly one OpenAI assistant
+      // message, carrying both text and tool_calls.
+      if (toolCalls.length > 0 && msg.role === 'assistant') {
+        messages.push({
+          role: 'assistant',
+          content: serializeContent(),
+          tool_calls: toolCalls,
+        });
       }
       // tool messages must come first so they stay adjacent to the preceding
       // assistant tool_calls message; user text content follows after.
-      messages.push(...pendingToolResults);
-      flushContentParts();
-      flushToolCalls();
+      messages.push(...toolResults);
+      if (contentParts.length > 0 && !(toolCalls.length > 0 && msg.role === 'assistant')) {
+        messages.push({ role: msg.role, content: serializeContent() });
+      }
     }
   }
 
